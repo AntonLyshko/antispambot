@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 VERIFIED_FILE = "verified_users.json"
 
+# Порог для автобана спама (90%)
+SPAM_AUTO_BAN_THRESHOLD = 90
+
 
 def load_verified() -> set[tuple[int, int]]:
     if not os.path.exists(VERIFIED_FILE):
@@ -361,16 +364,20 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    result = await check_message(text)
+    # Определяем контекст: это ответ на другое сообщение?
+    is_reply = msg.reply_to_message is not None
+
+    result = await check_message(text, is_reply=is_reply)
 
     if result:
         top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:5]
         top_str = ", ".join([f"{cat}: {score:.4f}" for cat, score in top])
         logger.info(
-            "📝 [%s] flagged=%s src=%s | %s | текст: %s",
+            "📝 [%s] flagged=%s src=%s is_reply=%s | %s | текст: %s",
             msg.from_user.full_name,
             result["flagged"],
             result.get("source", "?"),
+            is_reply,
             top_str,
             text[:100],
         )
@@ -408,6 +415,109 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "claude_spam": "Claude AI (антиспам)",
     }
 
+    # === СПАМ: отдельная логика с порогами ===
+    if source == "claude_spam":
+        spam_confidence = result.get("spam_confidence", 0)
+        url_info_list = result.get("url_info", [])
+
+        # Формируем строку с информацией о ссылках
+        url_info_str = ""
+        if url_info_list:
+            url_parts = []
+            for info in url_info_list:
+                if info:
+                    url_parts.append(
+                        f"  🔗 {info['url']}\n"
+                        f"     📄 {info['title']}"
+                    )
+            if url_parts:
+                url_info_str = "\n".join(url_parts)
+
+        if spam_confidence >= SPAM_AUTO_BAN_THRESHOLD:
+            # === 90%+ → автобан ===
+            logger.info("🚨 СПАМ-БАН: [%s] confidence=%d%% | %s",
+                        user_name, spam_confidence, text[:200])
+
+            try:
+                await msg.delete()
+            except Exception as e:
+                logger.error("Удаление: %s", e)
+
+            try:
+                await context.bot.ban_chat_member(chat_id, user_id)
+            except Exception as e:
+                logger.error("Бан: %s", e)
+
+            log_text = (
+                f"🚨 <b>Спамер заблокирован</b>\n\n"
+                f"👤 {user_name} (@{username})\n"
+                f"ID: <code>{user_id}</code>\n\n"
+                f"💬 <i>{text[:500]}</i>\n\n"
+            )
+            if url_info_str:
+                log_text += f"🌐 <b>Ссылки:</b>\n{url_info_str}\n\n"
+            log_text += (
+                f"📊 Уверенность: <b>{spam_confidence}%</b>\n"
+                f"🔍 Источник: {source_names.get(source, source)}\n"
+                f"⚡ Действие: Автобан (≥{SPAM_AUTO_BAN_THRESHOLD}%)"
+            )
+
+            buttons = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "✅ Разбанить",
+                    callback_data=f"mod_{chat_id}_{user_id}_unban",
+                ),
+            ]])
+
+            await send_log(context, log_text, reply_markup=buttons)
+
+        else:
+            # === 80-89% → на рассмотрение, БЕЗ действий ===
+            logger.info("⚠️ СПАМ-РЕВЬЮ: [%s] confidence=%d%% | %s",
+                        user_name, spam_confidence, text[:200])
+
+            log_text = (
+                f"⚠️ <b>Подозрение на спам — на рассмотрение</b>\n\n"
+                f"👤 {user_name} (@{username})\n"
+                f"ID: <code>{user_id}</code>\n\n"
+                f"💬 <i>{text[:500]}</i>\n\n"
+            )
+            if url_info_str:
+                log_text += f"🌐 <b>Ссылки:</b>\n{url_info_str}\n\n"
+            log_text += (
+                f"📊 Уверенность: <b>{spam_confidence}%</b>\n"
+                f"🔍 Источник: {source_names.get(source, source)}\n"
+                f"⚡ Действие: Нет (ожидает решения админа)"
+            )
+
+            buttons = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🚫 Забанить",
+                        callback_data=f"mod_{chat_id}_{user_id}_ban",
+                    ),
+                    InlineKeyboardButton(
+                        "🗑 Удалить",
+                        callback_data=f"mod_{chat_id}_{user_id}_kick",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔇 Мут 1 час",
+                        callback_data=f"mod_{chat_id}_{user_id}_mute1h",
+                    ),
+                    InlineKeyboardButton(
+                        "✅ OK (не спам)",
+                        callback_data=f"mod_{chat_id}_{user_id}_ok",
+                    ),
+                ],
+            ])
+
+            await send_log(context, log_text, reply_markup=buttons)
+
+        return
+
+    # === НЕ СПАМ: обычная токсичность — бан как раньше ===
     top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:3]
     top_str = "\n".join([
         f"  • {cat_names.get(cat, cat)}: {score:.0%}" for cat, score in top
@@ -461,9 +571,35 @@ async def on_mod_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "unban":
             await context.bot.unban_chat_member(chat_id, user_id)
             result = f"✅ Разбанен админом {admin}"
+
         elif action == "ban":
             await context.bot.ban_chat_member(chat_id, user_id)
             result = f"🚫 Забанен админом {admin}"
+
+        elif action == "kick":
+            await context.bot.ban_chat_member(chat_id, user_id)
+            await context.bot.unban_chat_member(chat_id, user_id)
+            result = f"🗑 Удалён админом {admin}"
+
+        elif action == "mute1h":
+            until = datetime.now(timezone.utc) + timedelta(hours=1)
+            await context.bot.restrict_chat_member(
+                chat_id, user_id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            result = f"🔇 Замьючен на 1 час админом {admin}"
+
+        elif action == "muteforever":
+            await context.bot.restrict_chat_member(
+                chat_id, user_id,
+                permissions=ChatPermissions(can_send_messages=False),
+            )
+            result = f"🔇 Замьючен навсегда админом {admin}"
+
+        elif action == "ok":
+            result = f"✅ Одобрено админом {admin} (не спам)"
+
         else:
             await query.answer("Неизвестное действие")
             return
@@ -513,6 +649,7 @@ def main():
     print("=" * 60)
     print("✅ Бот запущен!")
     print(f"   Верифицированных в базе: {len(verified_users)}")
+    print(f"   Порог автобана спама: {SPAM_AUTO_BAN_THRESHOLD}%")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

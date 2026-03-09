@@ -16,6 +16,61 @@ URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Паттерн для извлечения полных URL (только http/https/www)
+FULL_URL_PATTERN = re.compile(
+    r"(https?://\S+|www\.\S+)",
+    re.IGNORECASE,
+)
+
+
+async def fetch_url_info(url: str) -> dict | None:
+    """
+    Пытается получить заголовок страницы по URL.
+    """
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=8),
+                allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; ModBot/1.0)"},
+            ) as resp:
+                status = resp.status
+                final_url = str(resp.url)
+
+                if resp.content_type and "text/html" not in resp.content_type:
+                    return {
+                        "url": final_url,
+                        "title": f"[{resp.content_type}]",
+                        "status": status,
+                    }
+
+                chunk = await resp.content.read(16384)
+                text = chunk.decode("utf-8", errors="ignore")
+
+                import re as _re
+                title_match = _re.search(
+                    r"<title[^>]*>(.*?)</title>",
+                    text,
+                    _re.IGNORECASE | _re.DOTALL,
+                )
+                title = title_match.group(1).strip() if title_match else ""
+                title = " ".join(title.split())
+                if len(title) > 200:
+                    title = title[:200] + "…"
+
+                return {
+                    "url": final_url,
+                    "title": title or "(без заголовка)",
+                    "status": status,
+                }
+    except Exception as e:
+        logger.debug("fetch_url_info(%s): %s", url, e)
+        return None
+
 
 async def check_openai(text: str) -> dict | None:
     if not OPENAI_API_KEY:
@@ -99,9 +154,30 @@ async def check_claude_religion(text: str) -> dict | None:
         return None
 
 
-async def check_claude_spam(text: str) -> dict | None:
+async def check_claude_spam(text: str, url_info_list: list[dict] | None = None) -> dict | None:
+    """
+    Проверяет текст на спам с помощью Claude.
+    Возвращает confidence (0-100).
+    Толерантный промпт: пропускаем всё кроме явного спама.
+    """
     if not CLAUDE_API_KEY:
         return None
+
+    # Дополняем промпт информацией о ссылках
+    url_context = ""
+    if url_info_list:
+        url_parts = []
+        for info in url_info_list:
+            if info:
+                url_parts.append(
+                    f"  URL: {info['url']}\n  Заголовок страницы: {info['title']}"
+                )
+        if url_parts:
+            url_context = (
+                "\n\nИнформация о ссылках в сообщении:\n" +
+                "\n".join(url_parts)
+            )
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -113,26 +189,38 @@ async def check_claude_spam(text: str) -> dict | None:
                 },
                 json={
                     "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 10,
+                    "max_tokens": 20,
                     "messages": [
                         {
                             "role": "user",
                             "content": (
-                                "Ты модератор группового чата. Определи: является ли это сообщение РЕКЛАМОЙ или СПАМОМ?\n\n"
-                                "SPAM — это:\n"
-                                "- Реклама заработка, схем, инвестиций, казино, ставок\n"
-                                "- Реклама каналов, ботов, групп с призывом подписаться\n"
-                                "- Продажа товаров/услуг (не в тему чата)\n"
-                                "- Реклама непристойных услуг, интим-контента\n"
-                                "- Массовая рассылка, копипаста с призывом писать в ЛС\n"
-                                "- Мошенничество, фишинг, подозрительные ссылки\n\n"
-                                "OK — это:\n"
-                                "- Обычная ссылка в контексте обсуждения (YouTube видео по теме, статья)\n"
-                                "- Рекомендация друга (не массовая реклама)\n"
-                                "- Ссылка на источник в споре/обсуждении\n"
-                                "- Свой контент по теме чата без агрессивного продвижения\n\n"
-                                "Ответь ОДНИМ словом: SPAM или OK.\n\n"
+                                "Ты модератор исламского группового чата. "
+                                "Участники часто делятся полезными ссылками: лекции, статьи, "
+                                "YouTube видео, исламские ресурсы, новости, Telegram каналы по теме.\n\n"
+                                "Твоя задача — ловить ТОЛЬКО ЯВНЫЙ СПАМ. Будь максимально толерантен.\n\n"
+                                "Это ТОЧНО СПАМ (80-100):\n"
+                                "- Реклама заработка, финансовых схем, казино, ставок, крипто-скамов\n"
+                                "- Реклама интим-услуг, порно, знакомств\n"
+                                "- Мошенничество, фишинг, 'вы выиграли приз'\n"
+                                "- Массовая рассылка с призывом 'пишите в ЛС'\n"
+                                "- Продажа поддельных документов, наркотиков\n\n"
+                                "Это НЕ СПАМ (0-30):\n"
+                                "- Ссылка на YouTube видео, даже не по теме\n"
+                                "- Ссылка на статью, новость, блог\n"
+                                "- Ссылка на Telegram канал (даже свой) без агрессивного продвижения\n"
+                                "- Рекомендация приложения, книги, ресурса\n"
+                                "- Любая ссылка в контексте обсуждения\n"
+                                "- Ссылка на исламский ресурс, лекцию, учёного\n"
+                                "- Ссылка на магазин (халяль продукты, одежда и т.п.)\n"
+                                "- Всё что похоже на обычное общение между участниками\n\n"
+                                "СОМНИТЕЛЬНО (40-70) — только если реально подозрительно:\n"
+                                "- Ссылка вообще без контекста от нового участника\n"
+                                "- Подозрительный домен + подозрительный текст\n\n"
+                                "Помни: лучше пропустить спам, чем заблокировать обычного участника.\n\n"
+                                "Ответь ОДНИМ числом от 0 до 100 — уверенность что это СПАМ.\n"
+                                "Только число, ничего больше.\n\n"
                                 f"Сообщение: {text}"
+                                f"{url_context}"
                             ),
                         }
                     ],
@@ -144,23 +232,43 @@ async def check_claude_spam(text: str) -> dict | None:
                     return None
                 data = await resp.json()
 
-        answer = data["content"][0]["text"].strip().upper()
-        is_spam = "SPAM" in answer
+        answer = data["content"][0]["text"].strip()
 
-        logger.info("📩 Claude спам: '%s' → %s", text[:100], answer)
+        import re as _re
+        num_match = _re.search(r"\d+", answer)
+        if num_match:
+            confidence = int(num_match.group())
+            confidence = max(0, min(100, confidence))
+        else:
+            if "SPAM" in answer.upper():
+                confidence = 85
+            else:
+                confidence = 10
+
+        logger.info("📩 Claude спам: '%s' → %d%% | url_info=%s",
+                     text[:100], confidence,
+                     [i.get("title", "?") if i else "?" for i in (url_info_list or [])])
+
+        score = confidence / 100.0
 
         return {
-            "flagged": is_spam,
-            "categories": {"spam": is_spam},
-            "scores": {"spam": 1.0 if is_spam else 0.0},
+            "flagged": confidence >= 80,  # помечаем только от 80%
+            "categories": {"spam": confidence >= 80},
+            "scores": {"spam": score},
             "source": "claude_spam",
+            "spam_confidence": confidence,
+            "url_info": url_info_list,
         }
     except Exception as e:
         logger.error("Claude spam error: %s", e)
         return None
 
 
-async def check_message(text: str) -> dict | None:
+async def check_message(text: str, is_reply: bool = False) -> dict | None:
+    """
+    Проверяет сообщение.
+    is_reply — True если сообщение является ответом на другое сообщение.
+    """
     if not text or len(text.strip()) < 2:
         return None
 
@@ -177,9 +285,18 @@ async def check_message(text: str) -> dict | None:
             return claude_result
 
     # 3. Ссылка → Claude спам
-    if URL_PATTERN.search(text):
+    #    Если сообщение — ответ (reply), пропускаем проверку ссылок полностью
+    if URL_PATTERN.search(text) and not is_reply:
         logger.info("🔗 Ссылка найдена в: %s", text[:100])
-        spam_result = await check_claude_spam(text)
+
+        # Получаем информацию о ссылках
+        urls = FULL_URL_PATTERN.findall(text)
+        url_info_list = []
+        for url in urls[:3]:  # Максимум 3 ссылки
+            info = await fetch_url_info(url)
+            url_info_list.append(info)
+
+        spam_result = await check_claude_spam(text, url_info_list)
         if spam_result and spam_result["flagged"]:
             return spam_result
 
