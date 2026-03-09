@@ -36,8 +36,6 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 VERIFIED_FILE = "verified_users.json"
-
-# Порог для автобана спама (90%)
 SPAM_AUTO_BAN_THRESHOLD = 90
 
 
@@ -128,7 +126,6 @@ async def start_verification(chat_id, user_id, user_name, context):
     if key in pending_users or key in verified_users or key in known_users:
         return
 
-    # === CAS ===
     is_spammer = await check_cas(user_id)
     if is_spammer:
         try:
@@ -145,7 +142,6 @@ async def start_verification(chat_id, user_id, user_name, context):
         )
         return
 
-    # === Капча ===
     try:
         await context.bot.restrict_chat_member(
             chat_id=chat_id, user_id=user_id, permissions=MUTED,
@@ -320,7 +316,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         verified_users.add(key)
         save_verified()
 
-    # === АНТИФЛУД (админов не трогаем) ===
+    # === АНТИФЛУД ===
     if key not in known_users:
         is_flood = check_flood(chat_id, user_id)
         if is_flood:
@@ -364,9 +360,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Определяем контекст: это ответ на другое сообщение?
     is_reply = msg.reply_to_message is not None
-
     result = await check_message(text, is_reply=is_reply)
 
     if result:
@@ -385,8 +379,9 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not result["flagged"]:
-        # === Логируем отклонённые Claude (для отладки) ===
         source = result.get("source", "?")
+
+        # Логируем отклонённые Claude
         if source == "openai_rejected_by_claude":
             user_name = msg.from_user.full_name
             username = msg.from_user.username or ""
@@ -423,7 +418,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         callback_data=f"mod_{chat_id}_{user_id}_ban",
                     ),
                     InlineKeyboardButton(
-                        "🗑 Удалить сообщение",
+                        "🗑 Удалить",
                         callback_data=f"mod_{chat_id}_{user_id}_kick",
                     ),
                 ],
@@ -440,7 +435,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
 
             await send_log(context,
-                f"⚠️ <b>OpenAI flagged, Claude недоступен — на рассмотрение</b>\n\n"
+                f"⚠️ <b>OpenAI flagged, Claude недоступен</b>\n\n"
                 f"👤 {user_name} (@{username})\n"
                 f"ID: <code>{user_id}</code>\n\n"
                 f"💬 <i>{text[:300]}</i>\n\n"
@@ -451,6 +446,8 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         return
+
+    # === СООБЩЕНИЕ ПОМЕЧЕНО КАК НАРУШЕНИЕ ===
 
     user_name = msg.from_user.full_name
     username = msg.from_user.username or ""
@@ -481,12 +478,11 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "claude_spam": "Claude AI (антиспам)",
     }
 
-    # === СПАМ: отдельная логика с порогами ===
+    # === СПАМ ===
     if source == "claude_spam":
         spam_confidence = result.get("spam_confidence", 0)
         url_info_list = result.get("url_info", [])
 
-        # Формируем строку с информацией о ссылках
         url_info_str = ""
         if url_info_list:
             url_parts = []
@@ -500,7 +496,6 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 url_info_str = "\n".join(url_parts)
 
         if spam_confidence >= SPAM_AUTO_BAN_THRESHOLD:
-            # === 90%+ → автобан ===
             logger.info("🚨 СПАМ-БАН: [%s] confidence=%d%% | %s",
                         user_name, spam_confidence, text[:200])
 
@@ -538,7 +533,6 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_log(context, log_text, reply_markup=buttons)
 
         else:
-            # === 80-89% → на рассмотрение, БЕЗ действий ===
             logger.info("⚠️ СПАМ-РЕВЬЮ: [%s] confidence=%d%% | %s",
                         user_name, spam_confidence, text[:200])
 
@@ -583,7 +577,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # === ТОКСИЧНОСТЬ (OpenAI+Claude подтверждено, или Claude религия) — БАН ===
+    # === ТОКСИЧНОСТЬ — БАН ===
     top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:3]
     top_str = "\n".join([
         f"  • {cat_names.get(cat, cat)}: {score:.0%}" for cat, score in top
@@ -602,15 +596,44 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Удаление: %s", e)
 
     try:
-        await context.bot.ban_chat_member(_mod_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await context.bot.ban_chat_member(chat_id, user_id)
+    except Exception as e:
+        logger.error("Бан: %s", e)
+
+    log_text = (
+        f"🚨 <b>Заблокирован</b>\n\n"
+        f"👤 {user_name} (@{username})\n"
+        f"ID: <code>{user_id}</code>\n\n"
+        f"💬 <i>{text[:500]}</i>\n\n"
+        f"📊 Причина:\n{top_str}\n\n"
+        f"🔍 Источник: {source_names.get(source, source)}"
+        f"{claude_note}\n"
+        f"⚡ Действие: Бан + удаление"
+    )
+
+    buttons = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Разбанить",
+            callback_data=f"mod_{chat_id}_{user_id}_unban",
+        ),
+    ]])
+
+    await send_log(context, log_text, reply_markup=buttons)
+
+
+# ==========================================
+# КНОПКИ МОДЕРАЦИИ
+# ==========================================
+
+async def on_mod_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     parts = query.data.split("_")
     if len(parts) != 4:
         return
 
-    _, chat_id, user_id, action = parts
-    chat_id = int(chat_id)
-    user_id = int(user_id)
+    _, chat_id_str, user_id_str, action = parts
+    chat_id = int(chat_id_str)
+    user_id = int(user_id_str)
     admin = query.from_user.full_name
 
     try:
