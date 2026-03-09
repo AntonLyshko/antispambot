@@ -385,6 +385,71 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not result["flagged"]:
+        # === Логируем отклонённые Claude (для отладки) ===
+        source = result.get("source", "?")
+        if source == "openai_rejected_by_claude":
+            user_name = msg.from_user.full_name
+            username = msg.from_user.username or ""
+            claude_answer = result.get("claude_answer", "?")
+
+            top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:3]
+            top_str = "\n".join([
+                f"  • {cat}: {score:.0%}" for cat, score in top
+            ])
+
+            await send_log(context,
+                f"ℹ️ <b>OpenAI flagged → Claude отклонил</b>\n\n"
+                f"👤 {user_name} (@{username})\n"
+                f"ID: <code>{user_id}</code>\n\n"
+                f"💬 <i>{text[:300]}</i>\n\n"
+                f"📊 OpenAI оценки:\n{top_str}\n\n"
+                f"🤖 Claude ответ: {claude_answer}\n"
+                f"⚡ Действие: Нет (ложное срабатывание)"
+            )
+
+        elif source == "openai_unconfirmed":
+            user_name = msg.from_user.full_name
+            username = msg.from_user.username or ""
+
+            top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:3]
+            top_str = "\n".join([
+                f"  • {cat}: {score:.0%}" for cat, score in top
+            ])
+
+            buttons = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🚫 Забанить",
+                        callback_data=f"mod_{chat_id}_{user_id}_ban",
+                    ),
+                    InlineKeyboardButton(
+                        "🗑 Удалить сообщение",
+                        callback_data=f"mod_{chat_id}_{user_id}_kick",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔇 Мут 1 час",
+                        callback_data=f"mod_{chat_id}_{user_id}_mute1h",
+                    ),
+                    InlineKeyboardButton(
+                        "✅ OK",
+                        callback_data=f"mod_{chat_id}_{user_id}_ok",
+                    ),
+                ],
+            ])
+
+            await send_log(context,
+                f"⚠️ <b>OpenAI flagged, Claude недоступен — на рассмотрение</b>\n\n"
+                f"👤 {user_name} (@{username})\n"
+                f"ID: <code>{user_id}</code>\n\n"
+                f"💬 <i>{text[:300]}</i>\n\n"
+                f"📊 OpenAI оценки:\n{top_str}\n\n"
+                f"🤖 Claude: недоступен\n"
+                f"⚡ Действие: Нет (ожидает решения админа)",
+                reply_markup=buttons,
+            )
+
         return
 
     user_name = msg.from_user.full_name
@@ -411,6 +476,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     source_names = {
         "openai": "OpenAI Moderation",
+        "openai+claude": "OpenAI + Claude (подтверждено)",
         "claude": "Claude AI (религия)",
         "claude_spam": "Claude AI (антиспам)",
     }
@@ -517,11 +583,16 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # === НЕ СПАМ: обычная токсичность — бан как раньше ===
+    # === ТОКСИЧНОСТЬ (OpenAI+Claude подтверждено, или Claude религия) — БАН ===
     top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:3]
     top_str = "\n".join([
         f"  • {cat_names.get(cat, cat)}: {score:.0%}" for cat, score in top
     ])
+
+    claude_note = ""
+    if source == "openai+claude":
+        claude_answer = result.get("claude_answer", "BAN")
+        claude_note = f"\n🤖 Claude подтверждение: {claude_answer}"
 
     logger.info("🚨 БАН: [%s] src=%s | %s", user_name, source, text[:200])
 
@@ -531,32 +602,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Удаление: %s", e)
 
     try:
-        await context.bot.ban_chat_member(chat_id, user_id)
-    except Exception as e:
-        logger.error("Бан: %s", e)
-
-    log_text = (
-        f"🚨 <b>Заблокирован</b>\n\n"
-        f"👤 {user_name} (@{username})\n"
-        f"ID: <code>{user_id}</code>\n\n"
-        f"💬 <i>{text[:500]}</i>\n\n"
-        f"📊 Причина:\n{top_str}\n\n"
-        f"🔍 Источник: {source_names.get(source, source)}\n"
-        f"⚡ Действие: Бан + удаление"
-    )
-
-    buttons = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Разбанить", callback_data=f"mod_{chat_id}_{user_id}_unban"),
-    ]])
-
-    await send_log(context, log_text, reply_markup=buttons)
-
-
-# ==========================================
-# КНОПКИ МОДЕРАЦИИ
-# ==========================================
-
-async def on_mod_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await context.bot.ban_chat_member(_mod_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     parts = query.data.split("_")
     if len(parts) != 4:
@@ -650,6 +696,7 @@ def main():
     print("✅ Бот запущен!")
     print(f"   Верифицированных в базе: {len(verified_users)}")
     print(f"   Порог автобана спама: {SPAM_AUTO_BAN_THRESHOLD}%")
+    print(f"   Двойная проверка: OpenAI → Claude")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

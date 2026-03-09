@@ -102,6 +102,123 @@ async def check_openai(text: str) -> dict | None:
         return None
 
 
+async def check_claude_confirm(text: str, openai_categories: dict, openai_scores: dict) -> dict | None:
+    """
+    Перепроверяет сообщение, помеченное OpenAI, через Claude
+    с учётом контекста исламского чата.
+
+    Возвращает результат с подтверждением или отклонением.
+    """
+    if not CLAUDE_API_KEY:
+        return None
+
+    # Собираем сработавшие категории OpenAI для контекста
+    triggered_cats = []
+    cat_names_ru = {
+        "harassment": "оскорбление/травля",
+        "harassment/threatening": "угрозы расправы",
+        "hate": "разжигание ненависти",
+        "hate/threatening": "ненависть + угрозы",
+        "violence": "насилие",
+        "violence/graphic": "графическое насилие",
+        "sexual": "сексуальный контент",
+        "sexual/minors": "сексуализация детей",
+        "self-harm": "самоповреждение",
+        "self-harm/intent": "намерение самоповреждения",
+        "self-harm/instructions": "инструкции самоповреждения",
+        "illicit": "незаконная деятельность",
+        "illicit/violent": "незаконное насилие",
+    }
+
+    for cat, is_flagged in openai_categories.items():
+        if is_flagged:
+            score = openai_scores.get(cat, 0)
+            name = cat_names_ru.get(cat, cat)
+            triggered_cats.append(f"- {name}: {score:.0%}")
+
+    openai_context = "\n".join(triggered_cats) if triggered_cats else "- общее нарушение"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": CLAUDE_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 50,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Ты модератор исламского группового чата в Telegram. "
+                                "В чате обсуждают религию, исламскую культуру, повседневную жизнь.\n\n"
+
+                                "Система автомодерации (OpenAI) пометила сообщение как нарушение:\n"
+                                f"{openai_context}\n\n"
+
+                                "Твоя задача — ПЕРЕПРОВЕРИТЬ. Учитывай контекст исламского чата.\n\n"
+
+                                "ПОДТВЕРДИ нарушение (ответь BAN), если сообщение содержит:\n"
+                                "- Прямые оскорбления конкретных людей или групп\n"
+                                "- Разжигание ненависти к этническим/религиозным группам\n"
+                                "- Реальные угрозы насилия\n"
+                                "- Призывы к насилию или дискриминации\n"
+                                "- Сексуальный контент, порнографию\n"
+                                "- Контент с детьми сексуального характера\n"
+                                "- Инструкции по причинению вреда\n\n"
+
+                                "ОТКЛОНИ (ответь OK), если:\n"
+                                "- Это обсуждение религиозных тем (джихад, шахид и т.п. в религиозном контексте)\n"
+                                "- Цитирование Корана, хадисов, учёных\n"
+                                "- Обсуждение исторических событий (войны, конфликты)\n"
+                                "- Эмоциональное но не оскорбительное высказывание\n"
+                                "- Критика идей/действий без оскорбления людей\n"
+                                "- Обсуждение правил шариата, наказаний в исламе\n"
+                                "- Религиозные термины в нормальном контексте\n"
+                                "- Обсуждение политических событий без призывов к насилию\n"
+                                "- Спор/дискуссия на повышенных тонах без прямых оскорблений\n\n"
+
+                                "Помни: в исламском чате многие темы, которые OpenAI считает "
+                                "нарушением, являются нормальным обсуждением религии.\n"
+                                "Лучше пропустить сомнительное, чем забанить невиновного.\n\n"
+
+                                "Ответь ОДНИМ словом: BAN или OK\n\n"
+                                f"Сообщение: {text}"
+                            ),
+                        }
+                    ],
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    logger.error("Claude confirm %d: %s", resp.status, (await resp.text())[:300])
+                    return None
+                data = await resp.json()
+
+        answer = data["content"][0]["text"].strip().upper()
+        confirmed = "BAN" in answer
+
+        logger.info(
+            "🔍 Claude перепроверка: '%s' → %s (OpenAI категории: %s)",
+            text[:100], answer, ", ".join(
+                cat for cat, flagged in openai_categories.items() if flagged
+            ),
+        )
+
+        return {
+            "confirmed": confirmed,
+            "claude_answer": answer,
+        }
+
+    except Exception as e:
+        logger.error("Claude confirm error: %s", e)
+        return None
+
+
 async def check_claude_religion(text: str) -> dict | None:
     if not CLAUDE_API_KEY:
         return None
@@ -273,9 +390,52 @@ async def check_message(text: str, is_reply: bool = False) -> dict | None:
         return None
 
     # 1. OpenAI Moderation
-    result = await check_openai(text)
-    if result and result["flagged"]:
-        return result
+    openai_result = await check_openai(text)
+
+    if openai_result and openai_result["flagged"]:
+        # === ДВОЙНАЯ ПРОВЕРКА: OpenAI flagged → отправляем в Claude ===
+        logger.info(
+            "⚠️ OpenAI flagged: '%s' — отправляем на перепроверку в Claude",
+            text[:100],
+        )
+
+        claude_confirm = await check_claude_confirm(
+            text,
+            openai_result["categories"],
+            openai_result["scores"],
+        )
+
+        if claude_confirm is None:
+            # Claude недоступен — НЕ баним, отправляем на ревью
+            logger.warning(
+                "⚠️ Claude недоступен для перепроверки, пропускаем: '%s'",
+                text[:100],
+            )
+            openai_result["flagged"] = False
+            openai_result["claude_unavailable"] = True
+            openai_result["source"] = "openai_unconfirmed"
+            return openai_result
+
+        if claude_confirm["confirmed"]:
+            # Claude подтвердил — БАНИТЬ
+            logger.info(
+                "✅ Claude ПОДТВЕРДИЛ нарушение: '%s' → BAN",
+                text[:100],
+            )
+            openai_result["source"] = "openai+claude"
+            openai_result["claude_answer"] = claude_confirm["claude_answer"]
+            return openai_result
+        else:
+            # Claude отклонил — НЕ банить
+            logger.info(
+                "❌ Claude ОТКЛОНИЛ нарушение: '%s' → OK (ложное срабатывание)",
+                text[:100],
+            )
+            openai_result["flagged"] = False
+            openai_result["source"] = "openai_rejected_by_claude"
+            openai_result["claude_answer"] = claude_confirm["claude_answer"]
+            # Возвращаем как не-flagged, чтобы в логах было видно
+            return openai_result
 
     # 2. Триггер → Claude религия
     if TRIGGER_PATTERN.search(text):
@@ -301,6 +461,6 @@ async def check_message(text: str, is_reply: bool = False) -> dict | None:
             return spam_result
 
     # 4. Всё чисто
-    if result:
-        return result
+    if openai_result:
+        return openai_result
     return None
