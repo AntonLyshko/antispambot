@@ -639,7 +639,7 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # === ТОКСИЧНОСТЬ — БАН ===
+    # === ТОКСИЧНОСТЬ / КОНФЛИКТ — ТОЛЬКО ЛОГИРОВАНИЕ, БЕЗ АВТОБАНА ===
     top = sorted(
         result["scores"].items(), key=lambda x: x[1], reverse=True
     )[:3]
@@ -652,35 +652,44 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         claude_answer = result.get("claude_answer", "BAN")
         claude_note = f"\n🤖 Claude подтверждение: {claude_answer}"
 
-    logger.info("🚨 БАН: [%s] src=%s | %s", user_name, source, text[:200])
-
-    try:
-        await msg.delete()
-    except Exception as e:
-        logger.error("Удаление: %s", e)
-
-    try:
-        await context.bot.ban_chat_member(chat_id, user_id)
-    except Exception as e:
-        logger.error("Бан: %s", e)
+    logger.info(
+        "⚠️ НАРУШЕНИЕ (ручное управление): [%s] src=%s | %s",
+        user_name, source, text[:200],
+    )
 
     log_text = (
-        f"🚨 <b>Заблокирован</b>\n\n"
+        f"⚠️ <b>Обнаружено нарушение — на рассмотрение</b>\n\n"
         f"👤 {user_name} (@{username})\n"
         f"ID: <code>{user_id}</code>\n\n"
         f"💬 <i>{text[:500]}</i>\n\n"
         f"📊 Причина:\n{top_str}\n\n"
         f"🔍 Источник: {source_names.get(source, source)}"
         f"{claude_note}\n"
-        f"⚡ Действие: Бан + удаление"
+        f"⚡ Действие: Нет (ожидает решения админа)"
     )
 
-    buttons = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "✅ Разбанить",
-            callback_data=f"mod_{chat_id}_{user_id}_unban",
-        ),
-    ]])
+    buttons = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🚫 Забанить",
+                callback_data=f"mod_{chat_id}_{user_id}_ban",
+            ),
+            InlineKeyboardButton(
+                "🗑 Удалить",
+                callback_data=f"mod_{chat_id}_{user_id}_kick",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔇 Мут 1 час",
+                callback_data=f"mod_{chat_id}_{user_id}_mute1h",
+            ),
+            InlineKeyboardButton(
+                "✅ OK",
+                callback_data=f"mod_{chat_id}_{user_id}_ok",
+            ),
+        ],
+    ])
 
     await send_log(context, log_text, reply_markup=buttons)
 
@@ -783,6 +792,7 @@ def main():
     print("✅ Бот запущен!")
     print(f"   Верифицированных в базе: {len(verified_users)}")
     print(f"   Порог автобана спама: {SPAM_AUTO_BAN_THRESHOLD}%")
+    print(f"   Токсичность: только логирование (ручное управление)")
     print(f"   Двойная проверка: OpenAI → Claude")
     print(f"   Капча: мьют на время кнопки, снятие по таймеру")
     print("=" * 60)
