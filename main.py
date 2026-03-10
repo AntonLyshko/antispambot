@@ -38,6 +38,26 @@ logger = logging.getLogger(__name__)
 VERIFIED_FILE = "verified_users.json"
 SPAM_AUTO_BAN_THRESHOLD = 90
 
+MUTED = ChatPermissions(
+    can_send_messages=False, can_send_audios=False,
+    can_send_documents=False, can_send_photos=False,
+    can_send_videos=False, can_send_video_notes=False,
+    can_send_voice_notes=False, can_send_polls=False,
+    can_send_other_messages=False, can_add_web_page_previews=False,
+    can_change_info=False, can_invite_users=False,
+    can_pin_messages=False, can_manage_topics=False,
+)
+
+UNMUTED = ChatPermissions(
+    can_send_messages=True, can_send_audios=True,
+    can_send_documents=True, can_send_photos=True,
+    can_send_videos=True, can_send_video_notes=True,
+    can_send_voice_notes=True, can_send_polls=True,
+    can_send_other_messages=True, can_add_web_page_previews=True,
+    can_change_info=False, can_invite_users=True,
+    can_pin_messages=False, can_manage_topics=False,
+)
+
 
 def load_verified() -> set[tuple[int, int]]:
     if not os.path.exists(VERIFIED_FILE):
@@ -60,29 +80,14 @@ def save_verified():
 
 
 verified_users: set[tuple[int, int]] = load_verified()
-pending_users: dict[tuple[int, int], dict] = {}
+
+# unverified_users — зашли но НЕ нажали кнопку
+# captcha_active=True → мьют + кнопка висит
+# captcha_active=False → мьюта нет, кнопки нет, ждёт сообщение
+unverified_users: dict[tuple[int, int], dict] = {}
+
 known_users: set[tuple[int, int]] = set()
 admins_loaded: set[int] = set()
-
-MUTED = ChatPermissions(
-    can_send_messages=False, can_send_audios=False,
-    can_send_documents=False, can_send_photos=False,
-    can_send_videos=False, can_send_video_notes=False,
-    can_send_voice_notes=False, can_send_polls=False,
-    can_send_other_messages=False, can_add_web_page_previews=False,
-    can_change_info=False, can_invite_users=False,
-    can_pin_messages=False, can_manage_topics=False,
-)
-
-UNMUTED = ChatPermissions(
-    can_send_messages=True, can_send_audios=True,
-    can_send_documents=True, can_send_photos=True,
-    can_send_videos=True, can_send_video_notes=True,
-    can_send_voice_notes=True, can_send_polls=True,
-    can_send_other_messages=True, can_add_web_page_previews=True,
-    can_change_info=False, can_invite_users=True,
-    can_pin_messages=False, can_manage_topics=False,
-)
 
 
 async def send_log(context, text, reply_markup=None):
@@ -121,11 +126,96 @@ async def load_admins(chat_id, context):
         logger.error("Админы: %s", e)
 
 
-async def start_verification(chat_id, user_id, user_name, context):
+def _captcha_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Я не бот — пройти проверку",
+            callback_data=f"verify_{user_id}",
+        )
+    ]])
+
+
+async def activate_captcha(chat_id, user_id, user_name, context):
+    """Мьютит + отправляет кнопку + ставит таймер."""
     key = (chat_id, user_id)
-    if key in pending_users or key in verified_users or key in known_users:
+
+    # Мьют
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id, user_id=user_id, permissions=MUTED,
+        )
+    except Exception as e:
+        logger.error("Мьют %d: %s", user_id, e)
+
+    # Кнопка
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"👋 <b>{user_name}</b>, добро пожаловать!\n\n"
+            f"Нажмите кнопку ниже, чтобы подтвердить что вы не бот."
+        ),
+        parse_mode="HTML",
+        reply_markup=_captcha_keyboard(user_id),
+    )
+
+    unverified_users[key] = {
+        "user_name": user_name,
+        "captcha_msg_id": sent.message_id,
+        "captcha_active": True,
+    }
+
+    # Таймер на снятие капчи
+    context.application.create_task(
+        captcha_expire(context, chat_id, user_id, sent.message_id)
+    )
+
+
+async def captcha_expire(context, chat_id, user_id, msg_id):
+    """Через CAPTCHA_TIMEOUT: удаляет кнопку + снимает мьют."""
+    await asyncio.sleep(CAPTCHA_TIMEOUT)
+    key = (chat_id, user_id)
+
+    # Уже верифицирован
+    if key not in unverified_users:
         return
 
+    # Капча уже другая (пользователь успел написать и получил новую)
+    if unverified_users[key].get("captcha_msg_id") != msg_id:
+        return
+
+    # Удаляем кнопку тихо
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception:
+        pass
+
+    # Снимаем мьют
+    try:
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id, user_id=user_id, permissions=UNMUTED,
+        )
+    except Exception as e:
+        logger.error("Размьют %d: %s", user_id, e)
+
+    # Помечаем: капча неактивна, ждём сообщение
+    if key in unverified_users:
+        unverified_users[key]["captcha_active"] = False
+        unverified_users[key]["captcha_msg_id"] = None
+
+    logger.info(
+        "⏰ Капча истекла: user %d в чате %d — мьют снят, ждём сообщение",
+        user_id, chat_id,
+    )
+
+
+async def start_verification(chat_id, user_id, user_name, context):
+    key = (chat_id, user_id)
+    if key in verified_users or key in known_users:
+        return
+    if key in unverified_users:
+        return
+
+    # === CAS ===
     is_spammer = await check_cas(user_id)
     if is_spammer:
         try:
@@ -142,28 +232,8 @@ async def start_verification(chat_id, user_id, user_name, context):
         )
         return
 
-    try:
-        await context.bot.restrict_chat_member(
-            chat_id=chat_id, user_id=user_id, permissions=MUTED,
-        )
-    except Exception as e:
-        logger.error("Мьют %d: %s", user_id, e)
-        return
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "✅ Я не бот — пройти проверку",
-            callback_data=f"verify_{user_id}",
-        )
-    ]])
-
-    sent = await context.bot.send_message(
-        chat_id=chat_id,
-        text="👋 Новый участник, пройдите проверку!\n\nНажмите кнопку ниже.",
-        reply_markup=keyboard,
-    )
-
-    pending_users[key] = {"message_id": sent.message_id, "user_name": user_name}
+    # === Активируем капчу: мьют + кнопка ===
+    await activate_captcha(chat_id, user_id, user_name, context)
 
     await send_log(context,
         f"👤 <b>Новый участник</b>\n"
@@ -171,45 +241,6 @@ async def start_verification(chat_id, user_id, user_name, context):
         f"ID: <code>{user_id}</code>\n"
         f"CAS: ✅ чист\n"
         f"Ожидает проверку..."
-    )
-
-    context.application.create_task(
-        kick_if_not_verified(context, chat_id, user_id, user_name)
-    )
-
-
-async def kick_if_not_verified(context, chat_id, user_id, user_name):
-    await asyncio.sleep(CAPTCHA_TIMEOUT)
-    key = (chat_id, user_id)
-    data = pending_users.pop(key, None)
-    if data is None:
-        return
-
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=data["message_id"])
-    except Exception:
-        pass
-
-    try:
-        await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-        await context.bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
-    except Exception as e:
-        logger.error("Кик %d: %s", user_id, e)
-        return
-
-    sent = await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"❌ <b>{user_name}</b> не прошёл проверку и был удалён.",
-        parse_mode="HTML",
-    )
-
-    context.application.create_task(auto_delete(context, chat_id, sent.message_id, 15))
-
-    await send_log(context,
-        f"❌ <b>Не прошёл проверку</b>\n"
-        f"Имя: {user_name}\n"
-        f"ID: <code>{user_id}</code>\n"
-        f"Удалён по таймауту."
     )
 
 
@@ -221,7 +252,9 @@ async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE
     for member in msg.new_chat_members:
         if member.is_bot:
             continue
-        await start_verification(msg.chat_id, member.id, member.full_name, context)
+        await start_verification(
+            msg.chat_id, member.id, member.full_name, context,
+        )
 
 
 async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,7 +268,9 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
         if user.is_bot:
             return
         await load_admins(result.chat.id, context)
-        await start_verification(result.chat.id, user.id, user.full_name, context)
+        await start_verification(
+            result.chat.id, user.id, user.full_name, context,
+        )
 
 
 async def on_verify_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -252,14 +287,16 @@ async def on_verify_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     key = (chat_id, actual)
-    if key not in pending_users:
+    if key not in unverified_users:
         await query.answer("Проверка уже завершена.")
         return
 
-    pending_users.pop(key)
+    # Верифицирован!
+    unverified_users.pop(key)
     verified_users.add(key)
     save_verified()
 
+    # Снимаем мьют
     try:
         await context.bot.restrict_chat_member(
             chat_id=chat_id, user_id=actual, permissions=UNMUTED,
@@ -299,13 +336,26 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id
     key = (chat_id, user_id)
 
-    if key in pending_users:
+    # === НЕВЕРИФИЦИРОВАННЫЙ ПОЛЬЗОВАТЕЛЬ ===
+    if key in unverified_users:
+        data = unverified_users[key]
+
+        # Удаляем сообщение в любом случае
         try:
             await msg.delete()
         except Exception:
             pass
+
+        # Капча активна (мьют есть, кнопка висит) — просто удаляем сообщение
+        if data.get("captcha_active"):
+            return
+
+        # Капча неактивна (мьюта нет, кнопки нет) — запускаем новую капчу
+        user_name = data["user_name"]
+        await activate_captcha(chat_id, user_id, user_name, context)
         return
 
+    # === Первое сообщение от незнакомого пользователя ===
     if key not in verified_users and key not in known_users:
         if msg.from_user.is_bot:
             known_users.add(key)
@@ -313,10 +363,11 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await load_admins(chat_id, context)
         if key in known_users:
             return
+        # Старый участник — авто-верификация
         verified_users.add(key)
         save_verified()
 
-    # === АНТИФЛУД ===
+    # === АНТИФЛУД (админов не трогаем) ===
     if key not in known_users:
         is_flood = check_flood(chat_id, user_id)
         if is_flood:
@@ -344,7 +395,9 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
             )
 
-            context.application.create_task(auto_delete(context, chat_id, sent.message_id, 15))
+            context.application.create_task(
+                auto_delete(context, chat_id, sent.message_id, 15)
+            )
 
             await send_log(context,
                 f"🔇 <b>Антифлуд</b>\n\n"
@@ -364,7 +417,9 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await check_message(text, is_reply=is_reply)
 
     if result:
-        top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:5]
+        top = sorted(
+            result["scores"].items(), key=lambda x: x[1], reverse=True
+        )[:5]
         top_str = ", ".join([f"{cat}: {score:.4f}" for cat, score in top])
         logger.info(
             "📝 [%s] flagged=%s src=%s is_reply=%s | %s | текст: %s",
@@ -381,13 +436,14 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not result["flagged"]:
         source = result.get("source", "?")
 
-        # Логируем отклонённые Claude
         if source == "openai_rejected_by_claude":
             user_name = msg.from_user.full_name
             username = msg.from_user.username or ""
             claude_answer = result.get("claude_answer", "?")
 
-            top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:3]
+            top = sorted(
+                result["scores"].items(), key=lambda x: x[1], reverse=True
+            )[:3]
             top_str = "\n".join([
                 f"  • {cat}: {score:.0%}" for cat, score in top
             ])
@@ -406,7 +462,9 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_name = msg.from_user.full_name
             username = msg.from_user.username or ""
 
-            top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:3]
+            top = sorted(
+                result["scores"].items(), key=lambda x: x[1], reverse=True
+            )[:3]
             top_str = "\n".join([
                 f"  • {cat}: {score:.0%}" for cat, score in top
             ])
@@ -496,8 +554,10 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 url_info_str = "\n".join(url_parts)
 
         if spam_confidence >= SPAM_AUTO_BAN_THRESHOLD:
-            logger.info("🚨 СПАМ-БАН: [%s] confidence=%d%% | %s",
-                        user_name, spam_confidence, text[:200])
+            logger.info(
+                "🚨 СПАМ-БАН: [%s] confidence=%d%% | %s",
+                user_name, spam_confidence, text[:200],
+            )
 
             try:
                 await msg.delete()
@@ -533,8 +593,10 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_log(context, log_text, reply_markup=buttons)
 
         else:
-            logger.info("⚠️ СПАМ-РЕВЬЮ: [%s] confidence=%d%% | %s",
-                        user_name, spam_confidence, text[:200])
+            logger.info(
+                "⚠️ СПАМ-РЕВЬЮ: [%s] confidence=%d%% | %s",
+                user_name, spam_confidence, text[:200],
+            )
 
             log_text = (
                 f"⚠️ <b>Подозрение на спам — на рассмотрение</b>\n\n"
@@ -578,7 +640,9 @@ async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # === ТОКСИЧНОСТЬ — БАН ===
-    top = sorted(result["scores"].items(), key=lambda x: x[1], reverse=True)[:3]
+    top = sorted(
+        result["scores"].items(), key=lambda x: x[1], reverse=True
+    )[:3]
     top_str = "\n".join([
         f"  • {cat_names.get(cat, cat)}: {score:.0%}" for cat, score in top
     ])
@@ -720,6 +784,7 @@ def main():
     print(f"   Верифицированных в базе: {len(verified_users)}")
     print(f"   Порог автобана спама: {SPAM_AUTO_BAN_THRESHOLD}%")
     print(f"   Двойная проверка: OpenAI → Claude")
+    print(f"   Капча: мьют на время кнопки, снятие по таймеру")
     print("=" * 60)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
